@@ -1,6 +1,6 @@
 """
 Badge Management API Server with Brother QL Label Printer Integration
-Flask REST API for badge management and label printing
+Flask REST API for badge management and label printing - Windows Compatible
 """
 
 from flask import Flask, request, jsonify, send_file
@@ -14,6 +14,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 import os
+import sys
 import requests
 import pandas as pd
 from openpyxl import Workbook
@@ -34,8 +35,24 @@ EXTERNAL_API_URL = 'http://badges.eevent.ma/api/getbadges'
 
 # Brother QL Printer Configuration
 PRINTER_MODEL = "QL-810W"
-PRINTER_IDENTIFIER = "usb://0x04f9:0x209c"
-PRINTER_BACKEND = "pyusb"
+
+# Determine OS and set appropriate backend
+IS_WINDOWS = sys.platform.startswith('win')
+PRINTER_BACKEND = "pyusb" if not IS_WINDOWS else "network"  # or "win_usb"
+
+# Windows-compatible printer identifier
+# You'll need to update this based on your printer connection:
+# For USB on Windows: use "usb://0x04f9:0x209c" or the printer name
+# For Network: use "tcp://192.168.1.100" (replace with your printer's IP)
+if IS_WINDOWS:
+    # Option 1: Network printing (recommended for Windows)
+    PRINTER_IDENTIFIER = "tcp://192.168.1.100"  # CHANGE THIS to your printer's IP
+    
+    # Option 2: USB printing on Windows (uncomment if using USB)
+    # PRINTER_IDENTIFIER = "usb://0x04f9:0x209c"
+    # PRINTER_BACKEND = "pyusb"  # or try "win_usb" if pyusb doesn't work
+else:
+    PRINTER_IDENTIFIER = "usb://0x04f9:0x209c"
 
 # ==================== Database Helper Functions ====================
 
@@ -73,12 +90,55 @@ def init_db():
     conn.commit()
     conn.close()
 
+# ==================== Windows Font Helper Functions ====================
+
+def get_font_path(font_name, font_size):
+    """Get font path based on operating system"""
+    font = None
+    
+    if IS_WINDOWS:
+        # Windows font paths
+        windows_fonts_dir = os.path.join(os.environ.get('WINDIR', 'C:\\Windows'), 'Fonts')
+        font_paths = [
+            os.path.join(windows_fonts_dir, 'arial.ttf'),
+            os.path.join(windows_fonts_dir, 'arialbd.ttf'),
+            os.path.join(windows_fonts_dir, 'calibri.ttf'),
+            os.path.join(windows_fonts_dir, 'calibrib.ttf'),
+            os.path.join(windows_fonts_dir, 'segoeui.ttf'),
+            os.path.join(windows_fonts_dir, 'segoeuib.ttf'),
+        ]
+    else:
+        # Linux/Unix font paths
+        font_paths = [
+            'arial.ttf',
+            'calibri.ttf',
+            '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+            '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
+            'DejaVuSans.ttf',
+        ]
+    
+    # Try each font path
+    for font_path in font_paths:
+        if os.path.exists(font_path):
+            try:
+                font = ImageFont.truetype(font_path, font_size)
+                print(f"Using font: {font_path}")
+                return font
+            except Exception as e:
+                print(f"Could not load font {font_path}: {e}")
+                continue
+    
+    # Fallback to default font
+    print("Warning: No TrueType font found, using default font")
+    return ImageFont.load_default()
+
 # ==================== Brother QL Label Printer Functions ====================
 
 def check_supported_models():
     """Check supported models by running brother_ql info models."""
     try:
-        result = subprocess.run(['brother_ql', 'info', 'models'], capture_output=True, text=True)
+        result = subprocess.run(['brother_ql', 'info', 'models'], 
+                              capture_output=True, text=True, shell=IS_WINDOWS)
         return result.stdout
     except Exception as e:
         return f"Error checking models: {e}"
@@ -105,8 +165,9 @@ def create_label_image(first_name, last_name):
     font = None
     
     while font_size > 20:  # Minimum font size
-        try:
-            font = ImageFont.truetype("arial.ttf", font_size)
+        font = get_font_path("arial.ttf", font_size)
+        
+        if font:
             text_bbox = draw.textbbox((0, 0), full_name, font=font)
             text_width = text_bbox[2] - text_bbox[0]
             text_height = text_bbox[3] - text_bbox[1]
@@ -115,27 +176,13 @@ def create_label_image(first_name, last_name):
             if text_width <= max_text_width and text_height <= max_text_height:
                 break
             font_size -= 5  # Reduce font size and try again
-        except IOError:
-            print("Arial font not found. Trying alternative fonts...")
-            # Try alternative fonts
-            for font_name in ["calibri.ttf", "DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]:
-                try:
-                    font = ImageFont.truetype(font_name, font_size)
-                    break
-                except IOError:
-                    continue
-            if font is None:
-                print("No suitable font found. Using default font.")
-                font = ImageFont.load_default()
-                break
+        else:
+            break
 
     # Use minimum font size if text still doesn't fit
     if font_size <= 20:
         font_size = 20
-        try:
-            font = ImageFont.truetype("arial.ttf", font_size)
-        except IOError:
-            font = ImageFont.load_default()
+        font = get_font_path("arial.ttf", font_size)
 
     # Calculate text size and position for centering
     text_bbox = draw.textbbox((0, 0), full_name, font=font)
@@ -147,8 +194,11 @@ def create_label_image(first_name, last_name):
 
     # Center text vertically with adjustment for font metrics
     if hasattr(font, 'getmetrics'):
-        ascent, descent = font.getmetrics()
-        text_visual_height = ascent - descent
+        try:
+            ascent, descent = font.getmetrics()
+            text_visual_height = ascent - descent
+        except:
+            text_visual_height = text_height
     else:
         text_visual_height = text_height
     
@@ -160,7 +210,9 @@ def create_label_image(first_name, last_name):
     print(f"Using font size: {font_size}pt for '{full_name}'")
     return image
 
-def print_to_brother_ql(first_name, last_name, printer_identifier=PRINTER_IDENTIFIER, model=PRINTER_MODEL):
+def print_to_brother_ql(first_name, last_name, 
+                       printer_identifier=PRINTER_IDENTIFIER, 
+                       model=PRINTER_MODEL):
     """Print label to Brother QL printer"""
     # Check if model is valid
     supported_models = check_supported_models()
@@ -206,6 +258,8 @@ def print_to_brother_ql(first_name, last_name, printer_identifier=PRINTER_IDENTI
     except Exception as e:
         error_msg = f"Error printing label: {str(e)}"
         print(error_msg)
+        print(f"Printer Identifier: {printer_identifier}")
+        print(f"Backend: {PRINTER_BACKEND}")
         return {"status": "error", "message": error_msg}
 
 # ==================== QR Code Generation (for PDF fallback) ====================
@@ -339,28 +393,25 @@ def create_excel_export(badges_data):
 def index():
     """API information endpoint"""
     return jsonify({
-        'name': 'Badge Management API with Brother QL Printer',
-        'version': '2.0',
+        'name': 'Badge Management API with Brother QL Printer (Windows Compatible)',
+        'version': '2.1',
+        'platform': 'Windows' if IS_WINDOWS else 'Linux/Unix',
         'printer': {
             'model': PRINTER_MODEL,
-            'identifier': PRINTER_IDENTIFIER
+            'identifier': PRINTER_IDENTIFIER,
+            'backend': PRINTER_BACKEND
         },
         'endpoints': {
             'GET /api/getbadges': 'Get all badges (local + external)',
-            'GET /api/getbadges/local': 'Get local badges only',
-            'GET /api/getbadges/external': 'Get external badges only',
             'GET /api/getbadges/<id>': 'Get badge by ID',
             'POST /api/badges': 'Create new badge',
             'PUT /api/badges/<id>': 'Update badge',
             'DELETE /api/badges/<id>': 'Delete badge',
             'POST /print-label': 'Print badge to Brother QL printer',
             'POST /print-label-pdf': 'Generate PDF badge (fallback)',
-            'POST /user_data': 'Add user data',
             'GET /api/stats': 'Get statistics',
             'POST /api/validate/<id>': 'Validate badge',
             'GET /api/search': 'Search badges',
-            'POST /api/sync-external': 'Sync external badges to local DB',
-            'POST /api/import-excel': 'Import badges from Excel file',
             'GET /api/export-excel': 'Export badges to Excel file'
         }
     })
@@ -379,6 +430,32 @@ def get_all_badges():
         source = request.args.get('source', 'all')
         
         local_badges = []
+        if source in ['all', 'local']:
+            cursor.execute('SELECT * FROM users ORDER BY id ASC')
+            users = cursor.fetchall()
+            
+            for user in users:
+                if valide is not None and user['valide'] != valide:
+                    continue
+                
+                if search:
+                    search_lower = search.lower()
+                    if (search_lower not in user['nom'].lower() and 
+                        search_lower not in user['prenom'].lower() and 
+                        search_lower not in str(user['id'])):
+                        continue
+                
+                local_badges.append({
+                    'id': user['id'],
+                    'nom': user['nom'],
+                    'prenom': user['prenom'],
+                    'valide': user['valide'],
+                    'created_at': user['created_at'],
+                    'updated_at': user['updated_at'],
+                    'source': 'local'
+                })
+        
+        conn.close()
         
         # Get external badges
         external_badges = []
@@ -408,7 +485,7 @@ def get_all_badges():
         
         # Combine results
         all_badges = local_badges + external_badges
-        all_badges.sort(key=lambda x: x.get('id', 0))
+        all_badges.sort(key=lambda x: x.get('id', 0))  # Ascending order (oldest first)
         
         return jsonify(all_badges)
     
@@ -558,10 +635,66 @@ def print_label_pdf():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ... [Continue with all other endpoints from the original code]
-# [Including: create_badge, update_badge, delete_badge, validate_badge, 
-#  search_badges, get_statistics, sync_external_badges, import_excel, 
-#  export_excel, bulk_import, etc.]
+@app.route('/api/stats', methods=['GET'])
+def get_statistics():
+    """Get statistics"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('SELECT COUNT(*) as total FROM users')
+        total = cursor.fetchone()['total']
+        
+        cursor.execute('SELECT COUNT(*) as validated FROM users WHERE valide = 1')
+        validated = cursor.fetchone()['validated']
+        
+        cursor.execute('SELECT COUNT(*) as printed FROM print_logs')
+        printed = cursor.fetchone()['printed']
+        
+        conn.close()
+        
+        return jsonify({
+            'total_badges': total,
+            'validated_badges': validated,
+            'total_prints': printed
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/export-excel', methods=['GET'])
+def export_excel():
+    """Export all badges to Excel"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM users ORDER BY id ASC')
+        users = cursor.fetchall()
+        conn.close()
+        
+        badges_data = []
+        for user in users:
+            badges_data.append({
+                'id': user['id'],
+                'nom': user['nom'],
+                'prenom': user['prenom'],
+                'valide': user['valide'],
+                'created_at': user['created_at'],
+                'updated_at': user['updated_at'],
+                'source': 'local'
+            })
+        
+        excel_buffer = create_excel_export(badges_data)
+        
+        return send_file(
+            excel_buffer,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=f'badges_export_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
+        )
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 # ==================== Run Server ====================
 
@@ -569,14 +702,26 @@ if __name__ == '__main__':
     init_db()
     print("=" * 60)
     print("Badge Management API Server with Brother QL Printer")
+    print("Windows Compatible Version" if IS_WINDOWS else "Linux/Unix Version")
     print("=" * 60)
-    print("Server starting on http://127.0.0.1:5000")
+    print(f"Server starting on http://127.0.0.1:5000")
+    print(f"Platform: {'Windows' if IS_WINDOWS else 'Linux/Unix'}")
     print(f"Printer Model: {PRINTER_MODEL}")
     print(f"Printer Identifier: {PRINTER_IDENTIFIER}")
+    print(f"Printer Backend: {PRINTER_BACKEND}")
     print(f"External API: {EXTERNAL_API_URL}")
     print("\nPrinter endpoints:")
     print("  POST /print-label       - Print to Brother QL printer")
     print("  POST /print-label-pdf   - Generate PDF (fallback)")
+    if IS_WINDOWS:
+        print("\n⚠️  WINDOWS SETUP NOTES:")
+        print("  1. Update PRINTER_IDENTIFIER in the code with your printer's:")
+        print("     - Network IP: tcp://192.168.1.100")
+        print("     - OR USB: usb://0x04f9:0x209c")
+        print("  2. For USB printing, you may need to install:")
+        print("     - libusb: pip install libusb")
+        print("     - zadig (to install WinUSB driver for the printer)")
+        print("  3. Network printing is recommended for Windows")
     print("=" * 60)
     
     app.run(host='0.0.0.0', port=5000, debug=True)
